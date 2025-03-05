@@ -103,7 +103,6 @@ setup(
     entry_points={
         "torch_dynamo_backends": [
             "turbine_cpu = iree.turbine.dynamo.backends.cpu:backend",
-            "turbine_gpu = iree.turbine.dynamo.backends.gpu:backend",
         ],
     },
     install_requires=[
