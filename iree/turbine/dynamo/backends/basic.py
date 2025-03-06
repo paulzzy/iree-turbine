@@ -1,13 +1,18 @@
-# Copyright 2024 Advanced Micro Devices, Inc
+# Copyright 2025 Advanced Micro Devices, Inc
 #
 # Licensed under the Apache License v2.0 with LLVM Exceptions.
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 from typing import (
+    Optional,
     Union,
     List,
 )
+
+from pathlib import Path
+
+import sys
 
 from ...runtime.device import (
     DeviceState,
@@ -34,12 +39,33 @@ import torch
 from ..passes import turbine_cpu_pass_pipeline
 
 
-def basic_turbine(
+def backend_generator(
     *,
     target_backends: Union[List[str], str],
     flags: List[str] = [],
     driver: str,
+    save_mlir: Optional[Union[str, Path]] = None,
 ):
+    """
+    Users can call this directly with:
+        ```
+        from iree.turbine.dynamo.backends.basic import backend_generator
+        def my_func(...):
+            ...
+        my_backend = backend_generator(
+            target_backends=...,
+            flags=...,
+            driver=...,
+            )
+        compiled_func = torch.compile(my_func, my_backend)
+        y = compiled_func(*args)
+        ```
+    - target_backends mirror the options for `--iree-hal-target-backends` in `iree-compile`
+    - flags are for passing a list of `iree-compile` flags
+    - driver is for running the compiled artifact. E.g., `driver=local-task` for cpu or `driver=hip` for amd gpu
+    - save_mlir is for dumping the imported IR to a specified file.
+    """
+
     def _backend(gm: torch.export.ExportedProgram, example_inputs):
         # Set up the session, context and invocation.
         # Note that we do this on one in-memory module in a few phases:
@@ -69,6 +95,13 @@ def basic_turbine(
 
         # Import phase.
         importer.import_graph_module(gm)
+
+        # Save the imported mlir file if requested
+        if save_mlir:
+            p = Path(save_mlir)
+            p.write_text(str(module))
+        else:
+            print(module, file=sys.stderr)
 
         # IREE compilation phase.
         inv.execute()

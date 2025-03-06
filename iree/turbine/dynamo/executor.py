@@ -102,7 +102,7 @@ class SpecializedExecutable:
         # tensors that we send to the CPU and make continguous. Ideally, we would have
         # fast paths for our own backends and interop.
         for input in inputs:
-            input_cpu = input.cpu().contiguous()
+            input_cpu = input.detach().cpu().contiguous()
             # Since this is already a fallback case, just use the numpy array interop.
             # It isn't great, but meh... fallback case.
             device_array = asdevicearray(self.device_state.device, input_cpu)
