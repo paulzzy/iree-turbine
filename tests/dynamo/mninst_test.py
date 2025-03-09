@@ -6,6 +6,8 @@
 
 import logging
 import unittest
+import tempfile
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -15,6 +17,7 @@ import torchvision.datasets as datasets
 
 
 import torch._dynamo.config
+from iree.turbine.dynamo.backends.base import backend_generator
 
 torch._dynamo.config.dynamic_shapes = (
     False  # TODO: https://github.com/nod-ai/SHARK-ModelDev/issues/93
@@ -77,7 +80,7 @@ def infer_iteration(model, images):
     return outputs
 
 
-def infer():
+def infer(backend):
     # Example Parameters
     config = {
         "batch_size": 64,
@@ -89,15 +92,31 @@ def infer():
     test_loader = custom_data_loader.get_test_loader()
 
     model = MLP()
-    test_opt = torch.compile(infer_iteration, backend="turbine_cpu")
+    test_opt = torch.compile(infer_iteration, backend=backend)
 
     for i, (images, labels) in enumerate(test_loader):
         test_opt(model, images)
 
 
 class ModelTests(unittest.TestCase):
-    def testMNISTEagerSimple(self):
-        infer()
+    def testMNISTEagerDefaultCpu(self):
+        infer("turbine_cpu")
+
+    def testMNISTEagerCustomBackend(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "test_MNIST.mlir"
+            options = {
+                "target_backends": "llvm-cpu",
+                "flags": [
+                    "--iree-llvmcpu-target-cpu=host",
+                    "--iree-input-demote-f64-to-f32=false",
+                ],
+                "driver": "local-sync",
+                "save_mlir": path,
+            }
+            infer(backend_generator(**options))
+            mlir_str = path.read_text()
+            self.assertIn("func.func", mlir_str)
 
 
 if __name__ == "__main__":
