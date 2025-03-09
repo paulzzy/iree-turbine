@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 from torch._dynamo.backends.common import aot_autograd
-from basic import backend_generator
+from .base import backend_generator
 
 basic_cpu_options = {
     "target_backends": "llvm-cpu",
@@ -13,4 +13,4 @@ basic_cpu_options = {
     "driver": "local-task",
 }
 
-backend = aot_autograd(fw_compiler=backend_generator(**basic_cpu_options))
+backend = backend_generator(**basic_cpu_options)

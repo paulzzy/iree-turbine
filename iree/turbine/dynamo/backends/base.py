@@ -36,6 +36,8 @@ from iree.runtime import (
 from iree.compiler.extras.fx_importer import FxImporter
 
 import torch
+from torch._dynamo.backends.common import aot_autograd
+from functorch.compile import make_boxed_func
 from ..passes import turbine_cpu_pass_pipeline
 
 
@@ -50,6 +52,8 @@ def backend_generator(
     Users can call this directly with:
         ```
         from iree.turbine.dynamo.backends.basic import backend_generator
+        import torch
+
         def my_func(...):
             ...
         my_backend = backend_generator(
@@ -118,6 +122,7 @@ def backend_generator(
         )
         output.close()
 
-        return SpecializedExecutable(vmfb_module, device_state)
-
-    return _backend
+        # return a boxed function to allow compiling backwards graphs
+        return make_boxed_func(SpecializedExecutable(vmfb_module, device_state))
+    
+    return aot_autograd(fw_compiler=_backend)
