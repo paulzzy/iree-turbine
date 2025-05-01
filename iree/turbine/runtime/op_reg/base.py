@@ -53,6 +53,7 @@ __all__ = [
     "KernelSelection",
     "TensorArg",
     "def_library",
+    "fuse_custom_ops",
 ]
 
 
@@ -971,3 +972,218 @@ def _split_signature(sig: str) -> tuple[str, str]:
     if not m:
         raise ValueError(f"Expected signature of form `name(...) -> type. Got: {sig}")
     return m.group(1), m.group(2)
+
+
+class InnerKernelSelection(KernelSelection):
+    def __init__(self, op: CustomOp, arg_arity: int, base_ksel):
+        super().__init__(op, arg_arity)
+        diff_dir = set(dir(base_ksel)).difference(dir(KernelSelection))
+        for item in diff_dir:
+            val = base_ksel.__getattribute__(item)
+            if isinstance(val, Sequence) and len(val) > arg_arity:
+                val = val[0:arg_arity]
+            self.__setattr__(item, val)
+
+        self.base = type(base_ksel)
+        print(dir(self))
+        print(self.args)
+
+    def arg_tensor(self, arg: int, *, inplace_tied: bool = False) -> "TensorArg":
+        return self.base.arg_tensor(self, arg, inplace_tied=inplace_tied)
+
+    def arg_tensor_list(self, arg: int) -> "TensorListArg":
+        return self.base.arg_tensor_list(self, arg)
+
+    def arg_int(self, arg: int) -> "IntArg":
+        return self.base.arg_int(self, arg)
+
+    def attr_str(self, arg: int) -> "AttrArg":
+        return self.base.attr_str(self, arg)
+
+    def attr_int(self, arg: int) -> "AttrArg":
+        return self.base.attr_int(self, arg)
+
+    def attr_list_int(self, arg: int) -> "AttrArg":
+        return self.base.attr_list_int(self, arg)
+
+    def attr_float(self, arg: int) -> "AttrArg":
+        return self.base.attr_float(self, arg)
+
+    def attr_list_float(self, arg: int) -> "AttrArg":
+        return self.base.attr_list_float(self, arg)
+
+    def return_tensor(self, t: Tensor) -> "TensorArg":
+        return self.base.return_tensor(self, t)
+
+
+class OuterKernelSelection(KernelSelection):
+    def __init__(
+        self, op: CustomOp, arg_arity: int, base_ksel, inner_ksel, composition_mapping
+    ):
+        super().__init__(op, arg_arity)
+        diff_dir = set(dir(base_ksel)).difference(dir(KernelSelection))
+        self.offset = len(inner_ksel.arg_descs)
+        for item in diff_dir:
+            val = base_ksel.__getattribute__(item)
+            if isinstance(val, Sequence) and len(val) == len(base_ksel.arg_descs):
+                new_val = []
+                seen_comps = 0
+                for i in range(arg_arity):
+                    if i in composition_mapping.keys():
+                        seen_comps += 1
+                        new_val.append(None)
+                        continue
+                    new_val.append(
+                        val[i - seen_comps + self.offset]
+                        if i not in composition_mapping.keys()
+                        else None
+                    )
+                assert len(new_val) == arg_arity
+                val = new_val
+            self.__setattr__(item, val)
+
+        self.base = type(base_ksel)
+        self.inner_ksel = inner_ksel
+        self.reassociation_mapping = self._generate_reassociation_mapping(
+            self.offset, composition_mapping
+        )
+        self.composition_mapping = composition_mapping
+        print(self.args)
+
+    def _generate_reassociation_mapping(self, offset, composition_mapping):
+        """arg int < arg_arity   ->   re_arg < base_ksel arg_arity"""
+
+        def reassociate(arg: int) -> int:
+            arg += offset
+            seen_comps = 0
+            for k in composition_mapping.keys():
+                if k < arg:
+                    seen_comps += 1
+
+            return arg - seen_comps
+
+        return reassociate
+
+    def arg_tensor(self, arg: int, *, inplace_tied: bool = False) -> "TensorArg":
+        if arg in self.composition_mapping.keys():
+            print(self.composition_mapping[arg])
+            print(self.inner_ksel.result_descs[self.composition_mapping[arg]])
+            tensor_desc = self.inner_ksel.result_descs[self.composition_mapping[arg]]
+            self.arg_descs[arg] = tensor_desc
+            if inplace_tied:
+                self.inplace_tied_arg_descs.append(self.arg_descs[arg])
+            return tensor_desc
+        return self.base.arg_tensor(self, arg, inplace_tied=inplace_tied)
+
+    def arg_tensor_list(self, arg: int) -> "TensorListArg":
+        return self.base.arg_tensor_list(self, arg)
+
+    def arg_int(self, arg: int) -> "IntArg":
+        return self.base.arg_int(self, arg)
+
+    def attr_str(self, arg: int) -> "AttrArg":
+        return self.base.attr_str(self, arg)
+
+    def attr_int(self, arg: int) -> "AttrArg":
+        return self.base.attr_int(self, arg)
+
+    def attr_list_int(self, arg: int) -> "AttrArg":
+        return self.base.attr_list_int(self, arg)
+
+    def attr_float(self, arg: int) -> "AttrArg":
+        return self.base.attr_float(self, arg)
+
+    def attr_list_float(self, arg: int) -> "AttrArg":
+        return self.base.attr_list_float(self, arg)
+
+    def return_tensor(self, t: Tensor) -> "TensorArg":
+        return self.base.return_tensor(self, t)
+
+
+def fuse_custom_ops(
+    op_a: CustomOp, op_b: CustomOp, composition_mapping, library, fusion_name
+) -> CustomOp:
+    """Creates a custom op which composes op_b(..., op_a(*args), ...).
+    The composition mapping associates the index of an input of op_b, to an index of a result for op_a"""
+    name_a, arg_sig_a = _split_signature(op_a.signature)
+    name_b, arg_sig_b = _split_signature(op_b.signature)
+    inp_s_a, res_s_a = arg_sig_a.split(" -> ")
+    inp_s_b, res_s_b = arg_sig_b.split(" -> ")
+    inp_a = [item + "_a" for item in inp_s_a.strip("()").split(",")]
+    inp_b = [item + "_b" for item in inp_s_b.strip("()").split(",")]
+    res_a = res_s_a.strip("()").split(", ")
+    res_b = res_s_b.strip("()").split(", ")
+    inp = inp_a + [
+        item for i, item in enumerate(inp_b) if i not in composition_mapping.keys()
+    ]
+    res = [
+        item for i, item in enumerate(res_a) if i not in composition_mapping.values()
+    ] + res_b
+    fusion_name = fusion_name or f"fused_{name_a}_{name_b}"
+    fusion_signature = f'{fusion_name}({", ".join(inp)}) -> ({", ".join(res)})'
+
+    @CustomOp.register(library=library)
+    class fused_op(CustomOp):
+        signature = fusion_signature
+
+        def select(self, ksel: KernelSelection):
+            ksel_a = InnerKernelSelection(op_a, len(inp_a), ksel)
+            op_a.select(ksel_a)
+            self.ksel_a = ksel_a
+            ksel_b = OuterKernelSelection(
+                op_b, len(inp_b), ksel, ksel_a, composition_mapping
+            )
+            op_b.select(ksel_b)
+            seen_comps = 0
+            for i in range(len(inp_a) + len(inp_b)):
+                if i < len(inp_a):
+                    ksel.arg_descs[i] = ksel_a.arg_descs[i]
+                    continue
+                if i - len(inp_a) in composition_mapping.keys():
+                    seen_comps += 1
+                    continue
+                print(i - seen_comps)
+                ksel.arg_descs[i - seen_comps] = ksel_b.arg_descs[i - len(inp_a)]
+            self.ksel_b = ksel_b
+            ksel.result_descs = [
+                item
+                for i, item in enumerate(ksel_a.result_descs)
+                if i not in composition_mapping.values()
+            ] + ksel_b.result_descs
+            for arg in ksel.arg_descs:
+                if (
+                    arg in ksel_b.inplace_tied_arg_descs
+                    or arg in ksel_a.inplace_tied_arg_descs
+                ):
+                    ksel.inplace_tied_arg_descs.append(arg)
+
+        def generate(self, ksel: KernelSelection, kb: KernelBuilder):
+            print(self.ksel_a)
+            print(self.ksel_b)
+            print(ksel)
+            print(kb)
+            with kb.context, Location.unknown():
+                kb_0 = FreeFuncKernelBuilder(
+                    self.ksel_a,
+                    module_body=kb.module_body,
+                    symbol_table=SymbolTable(kb.module_body.owner),
+                    func_name="op_a",
+                )
+            with kb_0.ip, Location.unknown():
+                op_a.generate(self.ksel_a, kb_0)
+            print(kb.module_body)
+            # kb_1 = FreeFuncKernelBuilder.create_module(self.ksel_b, context=kb.context)
+            # with kb_1.ip, Location.unknown():
+            #     op_b.generate(self.ksel_b, kb_1)
+            # print(kb_1.module_op)
+            # print(kb.module_body)
+            # kb_1 = FreeFuncKernelBuilder.create_module(self.ksel_b)
+            # op_b.generate(self.ksel_b, kb_1)
+            # print(kb_1.module_op)
+            # print(kb.module_body)
+            # op_a.generate(self.ksel_a, kb)
+            # print(kb.module_body)
+            # op_b.generate(self.ksel_b, kb)
+            # print(kb.module_body)
+
+    return fused_op
