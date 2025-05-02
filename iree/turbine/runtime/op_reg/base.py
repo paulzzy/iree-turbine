@@ -23,13 +23,16 @@ from torch import Tensor
 from ...support.ir_imports import (
     Block,
     Context,
+    FlatSymbolRefAttr,
     FunctionType,
     IndexType,
     InsertionPoint,
     IntegerAttr,
     Location,
+    Operation,
     StringAttr,
     SymbolTable,
+    TypeAttr,
     IrType,
     Value,
     arith_d,
@@ -823,6 +826,7 @@ class FreeFuncKernelBuilder(KernelBuilder):
                 func_op.attributes["sym_visibility"] = StringAttr.get("private")
             entry_block: Block = func_op.add_entry_block()
             symbol_table.insert(func_op)
+            self.func_op = func_op
 
         # Map inputs to arg bindings, lining up with arguments that are elided.
         block_arguments = list(entry_block.arguments)
@@ -1044,25 +1048,8 @@ class OuterKernelSelection(KernelSelection):
 
         self.base = type(base_ksel)
         self.inner_ksel = inner_ksel
-        self.reassociation_mapping = self._generate_reassociation_mapping(
-            self.offset, composition_mapping
-        )
         self.composition_mapping = composition_mapping
         print(self.args)
-
-    def _generate_reassociation_mapping(self, offset, composition_mapping):
-        """arg int < arg_arity   ->   re_arg < base_ksel arg_arity"""
-
-        def reassociate(arg: int) -> int:
-            arg += offset
-            seen_comps = 0
-            for k in composition_mapping.keys():
-                if k < arg:
-                    seen_comps += 1
-
-            return arg - seen_comps
-
-        return reassociate
 
     def arg_tensor(self, arg: int, *, inplace_tied: bool = False) -> "TensorArg":
         if arg in self.composition_mapping.keys():
@@ -1098,6 +1085,25 @@ class OuterKernelSelection(KernelSelection):
 
     def return_tensor(self, t: Tensor) -> "TensorArg":
         return self.base.return_tensor(self, t)
+
+
+def call_function(target_function: Operation, *operands: Value) -> Sequence[Value]:
+    """Emits a util.call for a util.func target function operation."""
+    target_symbol = FlatSymbolRefAttr.get(
+        StringAttr(target_function.attributes["sym_name"]).value
+    )
+    call_op_name = (
+        "util.call" if target_function.name.value.startswith("util.") else "func.call"
+    )
+    ftype = FunctionType(TypeAttr(target_function.attributes["function_type"]).value)
+    return Operation.create(
+        call_op_name,
+        results=ftype.results,
+        operands=operands,
+        attributes={
+            "callee": target_symbol,
+        },
+    ).results
 
 
 def fuse_custom_ops(
@@ -1158,32 +1164,42 @@ def fuse_custom_ops(
                     ksel.inplace_tied_arg_descs.append(arg)
 
         def generate(self, ksel: KernelSelection, kb: KernelBuilder):
-            print(self.ksel_a)
-            print(self.ksel_b)
-            print(ksel)
-            print(kb)
             with kb.context, Location.unknown():
-                kb_0 = FreeFuncKernelBuilder(
+                kb_a = FreeFuncKernelBuilder(
                     self.ksel_a,
                     module_body=kb.module_body,
                     symbol_table=SymbolTable(kb.module_body.owner),
                     func_name="op_a",
                 )
-            with kb_0.ip, Location.unknown():
-                op_a.generate(self.ksel_a, kb_0)
-            print(kb.module_body)
-            # kb_1 = FreeFuncKernelBuilder.create_module(self.ksel_b, context=kb.context)
-            # with kb_1.ip, Location.unknown():
-            #     op_b.generate(self.ksel_b, kb_1)
-            # print(kb_1.module_op)
-            # print(kb.module_body)
-            # kb_1 = FreeFuncKernelBuilder.create_module(self.ksel_b)
-            # op_b.generate(self.ksel_b, kb_1)
-            # print(kb_1.module_op)
-            # print(kb.module_body)
-            # op_a.generate(self.ksel_a, kb)
-            # print(kb.module_body)
-            # op_b.generate(self.ksel_b, kb)
-            # print(kb.module_body)
+            with kb_a.ip, Location.unknown():
+                op_a.generate(self.ksel_a, kb_a)
+            with kb.context, Location.unknown():
+                kb_b = FreeFuncKernelBuilder(
+                    self.ksel_b,
+                    module_body=kb.module_body,
+                    symbol_table=SymbolTable(kb.module_body.owner),
+                    func_name="op_b",
+                )
+            with kb_b.ip, Location.unknown():
+                op_b.generate(self.ksel_b, kb_b)
+            print(kb.module_body.owner)
+            print(kb_a.func_op)
+            print(kb_b.func_op)
+            a_results = call_function(kb_a.func_op, *kb.arg_bindings[: len(inp_a)])
+            b_arg_bindings = []
+            for i in range(len(inp_b)):
+                if i not in composition_mapping.keys():
+                    b_arg_bindings.append(kb.arg_bindings[i])
+                    continue
+                b_arg_bindings.append(a_results[composition_mapping[i]])
+            b_results = call_function(kb_b.func_op, *b_arg_bindings)
+            all_results = [
+                res
+                for i, res in enumerate(a_results)
+                if i not in composition_mapping.values()
+            ] + [res for res in b_results]
+            kb.yield_results(*all_results)
+            print(kb.module_body.owner)
+            print(kb.ip.block.owner)
 
     return fused_op
