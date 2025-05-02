@@ -15,3 +15,18 @@ b1 = torch.ones([2, 1], device="cuda:0")
 
 c0 = op(a0, a1, b1)
 print(c0)
+
+
+class MyMod(torch.nn.Module):
+    def forward(self, x, y, z):
+        return op(x, y, z) + op(z, y, x)
+
+
+import iree.turbine.aot as aot
+
+e = aot.export(MyMod(), args=(a0, a1, b1))
+
+e.print_readable()
+
+e.import_to("full")
+e.print_readable()

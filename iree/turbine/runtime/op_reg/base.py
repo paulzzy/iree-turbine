@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 
 from ...support.ir_imports import (
+    Attribute,
     Block,
     Context,
     FlatSymbolRefAttr,
@@ -30,6 +31,7 @@ from ...support.ir_imports import (
     IntegerAttr,
     Location,
     Operation,
+    PassManager,
     StringAttr,
     SymbolTable,
     TypeAttr,
@@ -38,6 +40,7 @@ from ...support.ir_imports import (
     arith_d,
     builtin_d,
     func_d,
+    util_d,
 )
 
 from ...support.logging import runtime_logger as logger
@@ -787,8 +790,10 @@ class FreeFuncKernelBuilder(KernelBuilder):
         module_body: Block,
         symbol_table: SymbolTable,
         func_name: Optional[str] = None,
+        dialect: Any = func_d,
         is_public: bool = True,
     ):
+        self.dialect = dialect
         self.module_op = module_body.owner
         context = self.module_op.context
         if func_name is None:
@@ -821,10 +826,13 @@ class FreeFuncKernelBuilder(KernelBuilder):
 
             # Create the func.
             ftype = FunctionType.get(arg_types, result_types)
-            func_op = func_d.FuncOp(func_name, ftype)
+            func_op = dialect.FuncOp(
+                func_name, ftype if dialect == func_d else TypeAttr.get(ftype)
+            )
             if not is_public:
                 func_op.attributes["sym_visibility"] = StringAttr.get("private")
-            entry_block: Block = func_op.add_entry_block()
+            func_op.body.blocks.append(*ftype.inputs)
+            entry_block: Block = func_op.body.blocks[0]
             symbol_table.insert(func_op)
             self.func_op = func_op
 
@@ -861,6 +869,7 @@ class FreeFuncKernelBuilder(KernelBuilder):
         *,
         context: Optional[Context] = None,
         func_name: Optional[str] = None,
+        dialect: Any = func_d,
         is_public: bool = True,
     ) -> "FreeFuncKernelBuilder":
         """Short-cut to create a new module with a single function in one shot."""
@@ -873,6 +882,7 @@ class FreeFuncKernelBuilder(KernelBuilder):
                 module_body=module_op.body,
                 symbol_table=SymbolTable(module_op),
                 func_name=func_name,
+                dialect=dialect,
                 is_public=is_public,
             )
 
@@ -885,7 +895,7 @@ class FreeFuncKernelBuilder(KernelBuilder):
             len(results) == expected_count
         ), f"Mismatched yielded results and declared+inplace: Expected={expected_count}, Got={len(results)}"
         with self.ip, Location.unknown():
-            func_d.ReturnOp(results)
+            self.dialect.ReturnOp(results)
         self.yielded = True
 
 
@@ -989,8 +999,6 @@ class InnerKernelSelection(KernelSelection):
             self.__setattr__(item, val)
 
         self.base = type(base_ksel)
-        print(dir(self))
-        print(self.args)
 
     def arg_tensor(self, arg: int, *, inplace_tied: bool = False) -> "TensorArg":
         return self.base.arg_tensor(self, arg, inplace_tied=inplace_tied)
@@ -1049,12 +1057,9 @@ class OuterKernelSelection(KernelSelection):
         self.base = type(base_ksel)
         self.inner_ksel = inner_ksel
         self.composition_mapping = composition_mapping
-        print(self.args)
 
     def arg_tensor(self, arg: int, *, inplace_tied: bool = False) -> "TensorArg":
         if arg in self.composition_mapping.keys():
-            print(self.composition_mapping[arg])
-            print(self.inner_ksel.result_descs[self.composition_mapping[arg]])
             tensor_desc = self.inner_ksel.result_descs[self.composition_mapping[arg]]
             self.arg_descs[arg] = tensor_desc
             if inplace_tied:
@@ -1093,7 +1098,7 @@ def call_function(target_function: Operation, *operands: Value) -> Sequence[Valu
         StringAttr(target_function.attributes["sym_name"]).value
     )
     call_op_name = (
-        "util.call" if target_function.name.value.startswith("util.") else "func.call"
+        "util.call" if str(target_function.name).startswith("util.") else "func.call"
     )
     ftype = FunctionType(TypeAttr(target_function.attributes["function_type"]).value)
     return Operation.create(
@@ -1148,7 +1153,6 @@ def fuse_custom_ops(
                 if i - len(inp_a) in composition_mapping.keys():
                     seen_comps += 1
                     continue
-                print(i - seen_comps)
                 ksel.arg_descs[i - seen_comps] = ksel_b.arg_descs[i - len(inp_a)]
             self.ksel_b = ksel_b
             ksel.result_descs = [
@@ -1164,42 +1168,90 @@ def fuse_custom_ops(
                     ksel.inplace_tied_arg_descs.append(arg)
 
         def generate(self, ksel: KernelSelection, kb: KernelBuilder):
-            with kb.context, Location.unknown():
+            # create a nested module for inlining the IR and forcing into a single dispatch
+            with InsertionPoint(kb.module_body.operations[0]):
+                kb_c = FreeFuncKernelBuilder.create_module(
+                    ksel, context=kb.context, func_name=fusion_name, dialect=util_d
+                )
+
+            # Create kernel builders for each op within kb_c.module_body.
+            # These functions will eventually be inlined, so set is_public to False.
+            with kb_c.context, Location.unknown():
                 kb_a = FreeFuncKernelBuilder(
                     self.ksel_a,
-                    module_body=kb.module_body,
-                    symbol_table=SymbolTable(kb.module_body.owner),
+                    module_body=kb_c.module_body,
+                    symbol_table=SymbolTable(kb_c.module_body.owner),
+                    dialect=util_d,
                     func_name="op_a",
+                    is_public=False,
                 )
             with kb_a.ip, Location.unknown():
                 op_a.generate(self.ksel_a, kb_a)
-            with kb.context, Location.unknown():
+
+            with kb_c.context, Location.unknown():
                 kb_b = FreeFuncKernelBuilder(
                     self.ksel_b,
-                    module_body=kb.module_body,
-                    symbol_table=SymbolTable(kb.module_body.owner),
+                    module_body=kb_c.module_body,
+                    symbol_table=SymbolTable(kb_c.module_body.owner),
+                    dialect=util_d,
                     func_name="op_b",
+                    is_public=False,
                 )
             with kb_b.ip, Location.unknown():
                 op_b.generate(self.ksel_b, kb_b)
-            print(kb.module_body.owner)
-            print(kb_a.func_op)
-            print(kb_b.func_op)
-            a_results = call_function(kb_a.func_op, *kb.arg_bindings[: len(inp_a)])
+
+            # call the func_op for op_a within the fused func op body.
+            with kb_c.ip, Location.unknown():
+                a_results = call_function(
+                    kb_a.func_op, *kb_c.arg_bindings[: len(inp_a)]
+                )
+            # determine which IR values to call for op_b
             b_arg_bindings = []
             for i in range(len(inp_b)):
                 if i not in composition_mapping.keys():
-                    b_arg_bindings.append(kb.arg_bindings[i])
+                    b_arg_bindings.append(kb_c.arg_bindings[i])
                     continue
                 b_arg_bindings.append(a_results[composition_mapping[i]])
-            b_results = call_function(kb_b.func_op, *b_arg_bindings)
-            all_results = [
-                res
-                for i, res in enumerate(a_results)
-                if i not in composition_mapping.values()
-            ] + [res for res in b_results]
-            kb.yield_results(*all_results)
-            print(kb.module_body.owner)
-            print(kb.ip.block.owner)
+            # Call the func_op for op_b
+            with kb_c.ip, Location.unknown():
+                b_results = call_function(kb_b.func_op, *b_arg_bindings)
+                # Gather the results of the fused op
+                all_results = [
+                    res
+                    for i, res in enumerate(a_results)
+                    if i not in composition_mapping.values()
+                ] + [res for res in b_results]
+                # Yeild fused op results
+                kb_c.yield_results(*all_results)
+            # Inline the fused-op module and attach an attribute to force into a single dispatch.
+            pm = PassManager.parse("builtin.module(inline)", context=kb_c.context)
+            pm.run(kb_c.module_body.owner)
+            kb_c.func_op = kb_c.symbol_table[fusion_name]
+            pipeline_attr = Attribute.parse(
+                '#util.preprocessing_pipeline<"iree-preprocessing-make-single-dispatch">'
+            )
+            kb_c.func_op.attributes["preprocessing_pipeline"] = pipeline_attr
+            kb_c.func_op.attributes["inlining_policy"] = Attribute.parse(
+                "#util.inline.never"
+            )
+            source_module = kb_c.module_body.owner
+            # Hack to avoid a circular import.
+            from ...transforms.merger import Merger
+
+            merger = Merger(
+                source_module, kb.module_body.owner, target_symbol_table=kb.symbol_table
+            )
+            # Merge the modules and remove the empty kb_c.module_op
+            merger.merge()
+            assert (
+                len(kb_c.module_body.operations) == 0
+            ), "Expected an empty module after merge."
+            kb_c.module_op.erase()
+            kb.yield_results(
+                *call_function(
+                    kb.symbol_table[merger.translate_symbol(fusion_name)],
+                    *kb.arg_bindings,
+                )
+            )
 
     return fused_op
