@@ -119,6 +119,7 @@ def create_trace_json():
 def populate_trace_args(prefix: list[str], capture_trace_dir: str) -> list[str]:
     create_trace_json()
     prefix += ["rocprofv3", "-i", "input.json", "-d"]
+    prefix += ["--att", "--att-library-path", "/home/pauzhang/.local/share/rocprof-trace-decoder-ubuntu-22.04-0.1.2-Linux/opt/rocm/lib/"]
     prefix += [capture_trace_dir]
     prefix += ["--"]
     return prefix
@@ -136,8 +137,8 @@ def benchmark_module(
 ):
 
     prefix = []
-    if options.capture_trace:
-        prefix = populate_trace_args(prefix, options.capture_trace)
+    if options.capture_trace_dir:
+        prefix = populate_trace_args(prefix, options.capture_trace_dir)
     args = prefix + [iree.runtime.benchmark_exe()]
     args.append(f"--function={entry_function}")
     for k in kwargs:

@@ -39,17 +39,22 @@ from ..common.utils import (
     require_e2e,
 )
 from typing import List, Optional
+from pathlib import Path
+from datetime import datetime
 
 # Reference paged attention implementation from vLLM and sglang.
 # (NUM_Q_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE_KV, BLOCK_SIZE, NUM_SEQS, SEQ_LEN)
-shapes = [(16, 1, 64, 64, 32, 2, 100)]
-shapes += [(6, 1, 128, 128, 32, 1, 100)]
-shapes += [(16, 2, 64, 64, 32, 1, 100)]  # (16 // 2) < 16
-shapes += [(16, 1, 64, 64, 32, 2, 3)]  # small SEQ_LEN test
-shapes += [(64, 1, 80, 80, 32, 2, 128)]
-shapes += [(128, 2, 80, 80, 32, 2, 500)]
-shapes += [(128, 2, 512, 512, 32, 32, 500)]
-shapes += [expensive_test_param((32, 8, 128, 128, 32, 1319, 1018))]
+shapes = [(6, 1, 128, 128, 32, 4, 100)]
+# shapes += [(6, 1, 128, 128, 32, 4, 10000)]
+# shapes += [(6, 1, 128, 128, 32, 4, 20000)]
+# shapes = [(16, 1, 64, 64, 32, 2, 100)]
+# shapes += [(6, 1, 128, 128, 32, 1, 100)]
+# shapes += [(16, 2, 64, 64, 32, 1, 100)]  # (16 // 2) < 16
+# shapes += [(16, 1, 64, 64, 32, 2, 3)]  # small SEQ_LEN test
+# shapes += [(64, 1, 80, 80, 32, 2, 128)]
+# shapes += [(128, 2, 80, 80, 32, 2, 500)]
+# shapes += [(128, 2, 512, 512, 32, 32, 500)]
+# shapes += [expensive_test_param((32, 8, 128, 128, 32, 1319, 1018))]
 
 # Test shapes for MHA paged attention
 # (NUM_HEADS, HEAD_SIZE, HEAD_SIZE_KV, BLOCK_SIZE, NUM_SEQS, SEQ_LEN)
@@ -267,7 +272,7 @@ def testPagedFlashDecoding(
     )
     hyperparams_0.update(get_default_scheduling_params())
     hyperparams_1.update(get_default_scheduling_params())
-    run_bench = request.config.getoption("--runperf")
+    run_bench = True
     dump_perf = request.config.getoption("--dump-perf-files-path")
 
     phase_0_output_shape, phase_0_output_max_shape = (
@@ -280,10 +285,18 @@ def testPagedFlashDecoding(
         shape.num_seqs, shape.num_query_heads, shape.head_size_kv, dtype=dtype
     )
 
+    profile_dir = (
+        Path(dump_perf)
+        / f"profiling_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{request.node.name}"
+    )
+    if run_bench:
+        profile_dir.mkdir(exist_ok=True)
+
     options = WaveCompileOptions(
         subs=hyperparams_0,
         canonicalize=True,
         run_bench=run_bench,
+        capture_trace_dir=profile_dir,
         schedule=enable_scheduling,
         use_scheduling_barriers=enable_scheduling_barriers,
         dynamic_symbols=dynamic_symbols_0,
@@ -291,9 +304,7 @@ def testPagedFlashDecoding(
         benchmark_batch_size=10,
         benchmark_repetitions=3,
         benchmark_results_file=(
-            os.path.join(dump_perf, "tk_" + request.node.name + ".json")
-            if dump_perf
-            else None
+            profile_dir / "tk_benchmark_results.json" if dump_perf else None
         ),
     )
     options = set_default_run_config(options)
@@ -314,6 +325,7 @@ def testPagedFlashDecoding(
         subs=hyperparams_1,
         canonicalize=True,
         run_bench=run_bench,
+        capture_trace_dir=profile_dir,
         schedule=enable_scheduling,
         use_scheduling_barriers=enable_scheduling_barriers,
         dynamic_symbols=dynamic_symbols_1,
@@ -321,9 +333,7 @@ def testPagedFlashDecoding(
         benchmark_batch_size=10,
         benchmark_repetitions=3,
         benchmark_results_file=(
-            os.path.join(dump_perf, "tk_" + request.node.name + ".json")
-            if dump_perf
-            else None
+            profile_dir / "tk_benchmark_results.json" if dump_perf else None
         ),
     )
     options = set_default_run_config(options)

@@ -5,7 +5,7 @@ from .._support.indexing import IndexExpr, IndexSymbol
 from .._support.location_config import LocationCaptureConfig
 from .utils.classes import KernelLaunchInfo
 from ..compiler.kernel_codegen import KernelBufferUsage
-
+import os
 
 @dataclass
 class WaveCompileOptions:
@@ -39,8 +39,8 @@ class WaveCompileOptions:
     run_bench: bool = False
     benchmark_batch_size: int = None
     benchmark_repetitions: int = None
-    benchmark_results_file: str = None
-    capture_trace: bool = False
+    benchmark_results_file: str | None = None
+    capture_trace_dir: os.PathLike | None = None
     bench_with_constant_weights: bool = False
     bench_file: str = None
 
