@@ -290,13 +290,15 @@ def testPagedFlashDecoding(
         / f"profiling_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{request.node.name}"
     )
     if run_bench:
-        profile_dir.mkdir(exist_ok=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        Path(profile_dir / "phase_0").mkdir()
+        Path(profile_dir / "phase_1").mkdir()
 
     options = WaveCompileOptions(
         subs=hyperparams_0,
         canonicalize=True,
         run_bench=run_bench,
-        capture_trace_dir=profile_dir,
+        capture_trace_dir=profile_dir / "phase_0",
         schedule=enable_scheduling,
         use_scheduling_barriers=enable_scheduling_barriers,
         dynamic_symbols=dynamic_symbols_0,
@@ -304,7 +306,7 @@ def testPagedFlashDecoding(
         benchmark_batch_size=10,
         benchmark_repetitions=3,
         benchmark_results_file=(
-            profile_dir / "tk_benchmark_results.json" if dump_perf else None
+            profile_dir / "phase_0" / "tk_benchmark_results.json" if dump_perf else None
         ),
     )
     options = set_default_run_config(options)
@@ -325,7 +327,7 @@ def testPagedFlashDecoding(
         subs=hyperparams_1,
         canonicalize=True,
         run_bench=run_bench,
-        capture_trace_dir=profile_dir,
+        capture_trace_dir=profile_dir / "phase_1",
         schedule=enable_scheduling,
         use_scheduling_barriers=enable_scheduling_barriers,
         dynamic_symbols=dynamic_symbols_1,
@@ -333,7 +335,7 @@ def testPagedFlashDecoding(
         benchmark_batch_size=10,
         benchmark_repetitions=3,
         benchmark_results_file=(
-            profile_dir / "tk_benchmark_results.json" if dump_perf else None
+            profile_dir / "phase_1" / "tk_benchmark_results.json" if dump_perf else None
         ),
     )
     options = set_default_run_config(options)

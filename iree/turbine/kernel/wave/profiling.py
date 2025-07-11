@@ -119,7 +119,7 @@ def create_trace_json():
 def populate_trace_args(prefix: list[str], capture_trace_dir: str) -> list[str]:
     create_trace_json()
     prefix += ["rocprofv3", "-i", "input.json", "-d"]
-    prefix += ["--att", "--att-library-path", "/home/pauzhang/.local/share/rocprof-trace-decoder-ubuntu-22.04-0.1.2-Linux/opt/rocm/lib/"]
+    prefix += ["--att", "--att-library-path", "/root/rocprof-trace-decoder-ubuntu-22.04-0.1.2-Linux/opt/rocm/lib/"]
     prefix += [capture_trace_dir]
     prefix += ["--"]
     return prefix
@@ -175,6 +175,7 @@ def benchmark_module(
 
     benchmark_results = parse_benchmark_results(out)
     for file in tempfiles:
-        Path.unlink(file.name)
+        file.close()
+        Path(file.name).unlink()
 
     return benchmark_results
